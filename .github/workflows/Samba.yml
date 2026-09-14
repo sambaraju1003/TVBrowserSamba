@@ -1,0 +1,632 @@
+package com.tvbrowser.app
+
+import android.annotation.SuppressLint
+import android.app.Activity
+import android.content.ActivityNotFoundException
+import android.content.Intent
+import android.graphics.Bitmap
+import android.net.Uri
+import android.os.Bundle
+import android.speech.RecognizerIntent
+import android.view.KeyEvent
+import android.view.View
+import android.view.ViewGroup
+import android.webkit.*
+import android.widget.FrameLayout
+import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.*
+import androidx.compose.animation.core.*
+import androidx.compose.foundation.*
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import java.util.Locale
+
+// ─── Color Palette (10-foot TV UI) ───────────────────────────────
+val TvBg       = Color(0xFF0D0D0D)
+val TvSurface  = Color(0xFF1A1A2E)
+val TvPrimary  = Color(0xFF4FC3F7)
+val TvAccent   = Color(0xFF00E676)
+val TvButton   = Color(0xFF252540)
+val TvVoiceOn  = Color(0xFFFF1744)
+val TvTextDim  = Color(0xFF9E9E9E)
+
+// ─── Quick Links for Homepage ────────────────────────────────────
+data class QuickLink(val name: String, val url: String, val emoji: String)
+
+val QUICK_LINKS = listOf(
+    QuickLink("YouTube",    "https://www.youtube.com",       "▶️"),
+    QuickLink("Netflix",    "https://www.netflix.com",       "🎬"),
+    QuickLink("Google",     "https://www.google.com",        "🔍"),
+    QuickLink("Wikipedia",  "https://www.wikipedia.org",     "📚"),
+    QuickLink("Reddit",     "https://www.reddit.com",        "💬"),
+    QuickLink("Twitch",     "https://www.twitch.tv",         "🎮"),
+    QuickLink("Spotify",    "https://open.spotify.com",      "🎵"),
+    QuickLink("News",       "https://news.google.com",       "📰"),
+    QuickLink("Weather",    "https://weather.com",           "🌤️"),
+    QuickLink("Amazon",     "https://www.amazon.com",        "🛒"),
+    QuickLink("IMDb",       "https://www.imdb.com",          "⭐"),
+    QuickLink("Twitter/X",  "https://www.x.com",             "🐦"),
+)
+
+// ─── Main Activity ───────────────────────────────────────────────
+class MainActivity : ComponentActivity() {
+
+    private var activeWebView: WebView? = null
+    private var customView: View? = null
+    private var customViewCallback: WebChromeClient.CustomViewCallback? = null
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent {
+            Surface(color = TvBg, modifier = Modifier.fillMaxSize()) {
+                BrowserScreen(
+                    onWebViewReady = { activeWebView = it }
+                )
+            }
+        }
+    }
+
+    // TV Remote Back Button → navigate web history first, then exit
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        val wv = activeWebView
+        if (keyCode == KeyEvent.KEYCODE_BACK) {
+            if (customView != null) {
+                // Exit fullscreen video
+                customViewCallback?.onCustomViewHidden()
+                customView = null
+                return true
+            }
+            if (wv?.canGoBack() == true) {
+                wv.goBack()
+                return true
+            }
+        }
+        return super.onKeyDown(keyCode, event)
+    }
+}
+
+// ─── Browser Screen (Compose) ────────────────────────────────────
+@SuppressLint("SetJavaScriptEnabled")
+@Composable
+fun BrowserScreen(onWebViewReady: (WebView) -> Unit) {
+    val context = LocalContext.current
+    val activity = context as? MainActivity
+
+    var urlText       by remember { mutableStateOf("") }
+    var canGoBack     by remember { mutableStateOf(false) }
+    var canGoForward  by remember { mutableStateOf(false) }
+    var progress      by remember { mutableIntStateOf(0) }
+    var isLoading     by remember { mutableStateOf(false) }
+    var showHomepage  by remember { mutableStateOf(true) }
+    var isListening   by remember { mutableStateOf(false) }
+    var webView       by remember { mutableStateOf<WebView?>(null) }
+
+    // ── Smart URL Loader ──
+    fun loadUrl(input: String) {
+        val wv = webView ?: return
+        if (input.isBlank()) return
+        val url = when {
+            input.startsWith("http://") || input.startsWith("https://") -> input
+            input.contains(".") && !input.contains(" ")                 -> "https://$input"
+            else -> "https://www.google.com/search?q=${Uri.encode(input)}"
+        }
+        showHomepage = false
+        wv.loadUrl(url)
+    }
+
+    // ── Voice Recognition Launcher ──
+    val voiceLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        isListening = false
+        if (result.resultCode == Activity.RESULT_OK) {
+            val spoken = result.data
+                ?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
+                ?.firstOrNull()
+            if (!spoken.isNullOrBlank()) {
+                urlText = spoken
+                loadUrl(spoken)
+            }
+        }
+    }
+
+    fun startVoiceSearch() {
+        isListening = true
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL,
+                RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault())
+            putExtra(RecognizerIntent.EXTRA_PROMPT,
+                "Say a website or search term...")
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+        }
+        try {
+            voiceLauncher.launch(intent)
+        } catch (e: ActivityNotFoundException) {
+            isListening = false
+            Toast.makeText(context,
+                "Voice search not available on this device",
+                Toast.LENGTH_LONG).show()
+        }
+    }
+
+    Column(modifier = Modifier.fillMaxSize()) {
+
+        // ═══════════ TOP NAVIGATION BAR ═══════════
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(TvSurface)
+                .padding(horizontal = 16.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            // Back
+            TvNavButton("◀", canGoBack) {
+                webView?.goBack()
+            }
+            Spacer(Modifier.width(6.dp))
+
+            // Forward
+            TvNavButton("▶", canGoForward) {
+                webView?.goForward()
+            }
+            Spacer(Modifier.width(6.dp))
+
+            // Reload / Stop
+            TvNavButton(if (isLoading) "✕" else "⟳") {
+                if (isLoading) webView?.stopLoading() else webView?.reload()
+            }
+            Spacer(Modifier.width(6.dp))
+
+            // Home
+            TvNavButton("🏠") {
+                showHomepage = true
+                webView?.loadUrl("about:blank")
+            }
+            Spacer(Modifier.width(10.dp))
+
+            // Address Bar
+            TextField(
+                value = urlText,
+                onValueChange = { urlText = it },
+                modifier = Modifier
+                    .weight(1f)
+                    .height(52.dp),
+                singleLine = true,
+                placeholder = {
+                    Text("Search or enter URL...",
+                        color = TvTextDim, fontSize = 16.sp)
+                },
+                shape = RoundedCornerShape(12.dp),
+                colors = TextFieldDefaults.colors(
+                    focusedContainerColor   = Color(0xFF2A2A4A),
+                    unfocusedContainerColor = Color(0xFF1E1E36),
+                    focusedTextColor        = Color.White,
+                    unfocusedTextColor      = Color.LightGray,
+                    focusedIndicatorColor   = TvPrimary,
+                    unfocusedIndicatorColor = Color.Transparent,
+                    cursorColor             = TvPrimary
+                ),
+                textStyle = LocalTextStyle.current.copy(fontSize = 16.sp),
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Go),
+                keyboardActions = KeyboardActions(onGo = { loadUrl(urlText) })
+            )
+            Spacer(Modifier.width(10.dp))
+
+            // 🎤 Voice Assistant Button (pulsing when active)
+            VoiceButton(isListening) { startVoiceSearch() }
+            Spacer(Modifier.width(6.dp))
+
+            // GO
+            TvNavButton("GO", accent = true) { loadUrl(urlText) }
+        }
+
+        // ═══════════ PROGRESS BAR ═══════════
+        if (progress in 1..99) {
+            LinearProgressIndicator(
+                progress = { progress / 100f },
+                modifier = Modifier.fillMaxWidth().height(3.dp),
+                color = TvPrimary,
+                trackColor = TvSurface
+            )
+        }
+
+        // ═══════════ VOICE LISTENING OVERLAY ═══════════
+        if (isListening) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xCC000000))
+                    .padding(24.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                VoiceListeningIndicator()
+            }
+        }
+
+        // ═══════════ CONTENT AREA ═══════════
+        Box(modifier = Modifier.fillMaxSize()) {
+
+            // WebView (always present, hidden behind homepage when needed)
+            AndroidView(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .graphicsLayer { alpha = if (showHomepage) 0f else 1f },
+                factory = { ctx ->
+                    WebView(ctx).apply {
+                        layoutParams = FrameLayout.LayoutParams(
+                            ViewGroup.LayoutParams.MATCH_PARENT,
+                            ViewGroup.LayoutParams.MATCH_PARENT
+                        )
+
+                        settings.apply {
+                            javaScriptEnabled = true
+                            domStorageEnabled = true
+                            databaseEnabled = true
+                            loadWithOverviewMode = true
+                            useWideViewPort = true
+                            setSupportZoom(true)
+                            builtInZoomControls = true
+                            displayZoomControls = false
+                            mediaPlaybackRequiresUserGesture = false
+                            mixedContentMode =
+                                WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                            cacheMode = WebSettings.LOAD_DEFAULT
+
+                            // Desktop user-agent → full widescreen layouts on TV
+                            userAgentString =
+                                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+                                "AppleWebKit/537.36 (KHTML, like Gecko) " +
+                                "Chrome/124.0.0.0 Safari/537.36"
+                        }
+
+                        CookieManager.getInstance().apply {
+                            setAcceptCookie(true)
+                            setAcceptThirdPartyCookies(this@apply, true)
+                        }
+
+                        isFocusable = true
+                        isFocusableInTouchMode = true
+                        scrollBarStyle = View.SCROLLBARS_OUTSIDE_OVERLAY
+
+                        webViewClient = object : WebViewClient() {
+                            override fun onPageStarted(
+                                view: WebView?, url: String?, favicon: Bitmap?
+                            ) {
+                                super.onPageStarted(view, url, favicon)
+                                isLoading = true
+                                urlText = url ?: urlText
+                            }
+
+                            override fun onPageFinished(
+                                view: WebView?, url: String?
+                            ) {
+                                super.onPageFinished(view, url)
+                                isLoading = false
+                                urlText = url ?: urlText
+                                canGoBack = view?.canGoBack() ?: false
+                                canGoForward = view?.canGoForward() ?: false
+                            }
+
+                            override fun shouldOverrideUrlLoading(
+                                view: WebView?, request: WebResourceRequest?
+                            ): Boolean {
+                                val u = request?.url.toString()
+                                // Block non-http schemes (intent://, market://, etc.)
+                                if (!u.startsWith("http")) return true
+                                return false
+                            }
+                        }
+
+                        webChromeClient = object : WebChromeClient() {
+                            override fun onProgressChanged(
+                                view: WebView?, newProgress: Int
+                            ) {
+                                progress = newProgress
+                            }
+
+                            // Fullscreen video support (YouTube, Netflix, etc.)
+                            override fun onShowCustomView(
+                                view: View?, callback: CustomViewCallback?
+                            ) {
+                                activity?.let { act ->
+                                    act.customViewCallback?.onCustomViewHidden()
+                                    act.customView = view
+                                    act.customViewCallback = callback
+                                    (act.window.decorView as FrameLayout)
+                                        .addView(
+                                            view,
+                                            FrameLayout.LayoutParams(
+                                                ViewGroup.LayoutParams.MATCH_PARENT,
+                                                ViewGroup.LayoutParams.MATCH_PARENT
+                                            )
+                                        )
+                                }
+                            }
+
+                            override fun onHideCustomView() {
+                                activity?.let { act ->
+                                    (act.window.decorView as FrameLayout)
+                                        .removeView(act.customView)
+                                    act.customViewCallback?.onCustomViewHidden()
+                                    act.customView = null
+                                    act.customViewCallback = null
+                                }
+                            }
+                        }
+
+                        webView = this
+                        onWebViewReady(this)
+                    }
+                }
+            )
+
+            // ═══════════ HOMEPAGE OVERLAY ═══════════
+            if (showHomepage) {
+                HomepageScreen(
+                    onLinkClick = { link ->
+                        urlText = link.url
+                        loadUrl(link.url)
+                    },
+                    onVoiceClick = { startVoiceSearch() }
+                )
+            }
+        }
+    }
+}
+
+// ─── Homepage with Quick Links Grid ──────────────────────────────
+@Composable
+fun HomepageScreen(
+    onLinkClick: (QuickLink) -> Unit,
+    onVoiceClick: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(TvBg)
+            .padding(40.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Spacer(Modifier.height(40.dp))
+
+        Text(
+            "🌐 TV Browser",
+            fontSize = 42.sp,
+            fontWeight = FontWeight.Bold,
+            color = Color.White
+        )
+        Text(
+            "Select a site or press 🎤 to speak",
+            fontSize = 20.sp,
+            color = TvTextDim,
+            modifier = Modifier.padding(top = 8.dp, bottom = 32.dp)
+        )
+
+        // Big Voice Button
+        VoiceHeroButton { onVoiceClick() }
+
+        Spacer(Modifier.height(36.dp))
+
+        // Quick Links Grid
+        LazyVerticalGrid(
+            columns = GridCells.Fixed(4),
+            horizontalArrangement = Arrangement.spacedBy(16.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            items(QUICK_LINKS) { link ->
+                QuickLinkCard(link) { onLinkClick(link) }
+            }
+        }
+    }
+}
+
+// ─── Quick Link Card (D-pad focusable) ───────────────────────────
+@Composable
+fun QuickLinkCard(link: QuickLink, onClick: () -> Unit) {
+    var focused by remember { mutableStateOf(false) }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(16.dp))
+            .background(if (focused) TvPrimary.copy(alpha = 0.2f) else TvSurface)
+            .border(
+                width = if (focused) 3.dp else 0.dp,
+                color = if (focused) TvPrimary else Color.Transparent,
+                shape = RoundedCornerShape(16.dp)
+            )
+            .focusable(true)
+            .onFocusChanged { focused = it.isFocused }
+            .clickable { onClick() }
+            .padding(20.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text(link.emoji, fontSize = 40.sp)
+        Spacer(Modifier.height(8.dp))
+        Text(
+            link.name,
+            fontSize = 16.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = if (focused) TvPrimary else Color.White,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+    }
+}
+
+// ─── Voice Hero Button (Homepage Center) ─────────────────────────
+@Composable
+fun VoiceHeroButton(onClick: () -> Unit) {
+    var focused by remember { mutableStateOf(false) }
+    val infiniteTransition = rememberInfiniteTransition(label = "pulse")
+    val pulseScale by infiniteTransition.animateFloat(
+        initialValue = 1f,
+        targetValue = 1.08f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(800, easing = EaseInOutSine),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "scale"
+    )
+
+    Box(
+        modifier = Modifier
+            .size(120.dp)
+            .scale(if (focused) pulseScale else 1f)
+            .clip(CircleShape)
+            .background(if (focused) TvVoiceOn else TvButton)
+            .border(
+                width = if (focused) 4.dp else 2.dp,
+                color = TvVoiceOn,
+                shape = CircleShape
+            )
+            .focusable(true)
+            .onFocusChanged { focused = it.isFocused }
+            .clickable { onClick() },
+        contentAlignment = Alignment.Center
+    ) {
+        Text("🎤", fontSize = 48.sp)
+    }
+}
+
+// ─── Voice Listening Indicator ───────────────────────────────────
+@Composable
+fun VoiceListeningIndicator() {
+    val infiniteTransition = rememberInfiniteTransition(label = "listen")
+    val scale by infiniteTransition.animateFloat(
+        initialValue = 0.8f,
+        targetValue = 1.2f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(600, easing = EaseInOutSine),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "mic-scale"
+    )
+
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Box(
+            modifier = Modifier
+                .size(100.dp)
+                .scale(scale)
+                .clip(CircleShape)
+                .background(TvVoiceOn.copy(alpha = 0.3f)),
+            contentAlignment = Alignment.Center
+        ) {
+            Text("🎤", fontSize = 48.sp)
+        }
+        Spacer(Modifier.height(16.dp))
+        Text(
+            "Listening...",
+            fontSize = 28.sp,
+            fontWeight = FontWeight.Bold,
+            color = Color.White
+        )
+        Text(
+            "Say a website name or search query",
+            fontSize = 18.sp,
+            color = TvTextDim
+        )
+    }
+}
+
+// ─── Navigation Bar Button (D-pad optimized) ────────────────────
+@Composable
+fun TvNavButton(
+    text: String,
+    enabled: Boolean = true,
+    accent: Boolean = false,
+    onClick: () -> Unit
+) {
+    var focused by remember { mutableStateOf(false) }
+
+    Button(
+        onClick = onClick,
+        enabled = enabled,
+        shape = RoundedCornerShape(10.dp),
+        colors = ButtonDefaults.buttonColors(
+            containerColor = when {
+                !enabled  -> Color(0xFF1A1A1A)
+                focused   -> if (accent) TvAccent else TvPrimary
+                else      -> TvButton
+            },
+            contentColor = when {
+                !enabled  -> Color(0xFF555555)
+                focused   -> Color.Black
+                else      -> Color.White
+            }
+        ),
+        modifier = Modifier
+            .height(52.dp)
+            .onFocusChanged { focused = it.isFocused }
+    ) {
+        Text(
+            text,
+            fontSize = 18.sp,
+            fontWeight = FontWeight.Bold
+        )
+    }
+}
+
+// ─── Voice Button in Nav Bar ─────────────────────────────────────
+@Composable
+fun VoiceButton(isListening: Boolean, onClick: () -> Unit) {
+    var focused by remember { mutableStateOf(false) }
+    val infiniteTransition = rememberInfiniteTransition(label = "voice-btn")
+    val pulse by infiniteTransition.animateFloat(
+        initialValue = 1f,
+        targetValue = 1.15f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(500, easing = EaseInOutSine),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "pulse"
+    )
+
+    Button(
+        onClick = onClick,
+        shape = CircleShape,
+        colors = ButtonDefaults.buttonColors(
+            containerColor = when {
+                isListening -> TvVoiceOn
+                focused     -> TvVoiceOn.copy(alpha = 0.7f)
+                else        -> TvButton
+            },
+            contentColor = Color.White
+        ),
+        modifier = Modifier
+            .size(52.dp)
+            .scale(if (isListening) pulse else 1f)
+            .onFocusChanged { focused = it.isFocused }
+    ) {
+        Text("🎤", fontSize = 22.sp)
+    }
+}
